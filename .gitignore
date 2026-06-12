@@ -4,6 +4,7 @@ outputs/videos/
 *.part
 data/raw/
 __pycache__/
+**/__pycache__/
 .env
 client_secret*.json
 client_secrets.json
@@ -11,3 +12,6 @@ token*.json
 *.tar
 *.tar.gz
 download_all.log
+*_backup.py
+README.public_backup.md
+/videos.sha256

@@ -1,148 +1,169 @@
-# Stop-Piramida Video Dataset
+# Stop-Piramida Video Dataset Downloader
 
-Dataset of public anti-fraud videos from Stop-Piramida.
+Metadata and a cross-platform downloader for 593 public videos from Stop-Piramida.kz.
 
+The videos are not stored in this GitHub repository. Users download the videos locally with the included Playwright-based downloader.
+
+## Dataset Stats
+
+- Metadata records: 593
+- Downloaded locally by maintainer: 590
+- Missing known: 3
 - Source: https://stop-piramida.kz/videos
-- Videos found: 593
-- Videos downloaded: 590
-- Missing videos: 3
-- Video archive size: 15GB
-- Google Drive video archive: DRIVE_LINK_HERE
 
-## Categories
+## Requirements
 
-- `dropperstvo`
-- `fejkovyie-vyiplatyi`
-- `finansovyie-piramidyi`
-- `fishing`
-- `kriptoriski`
-- `lzhe-kredityi`
-- `lzheprodavczyi`
-- `lzheturizm`
-- `lzhexalyal`
-- `lzheyuristyi`
-- `lzhezarabotok`
-- `rabota-za-graniczej`
-- `riski-v-setevom-marketinge`
-- `roditelyam-na-zametku`
-- `romanticheskoe-moshennichestvo`
-- `stop-mfo`
-- `telefonnoe-moshennichestvo`
+- Python 3.10+
+- Chromium or Google Chrome
+- `ffmpeg` and `ffprobe`
 
-## Repository Structure
+Platform-specific setup:
 
-```text
-data/
-  metadata/
-    all_videos.jsonl
-    download_status.jsonl
-release/
-  README.md
-  videos.csv
-  missing_videos.txt
-  videos.sha256
-  metadata/
-    all_videos.jsonl
-    download_status.jsonl
-  scripts/
-    download_videoteca.py
-    download_videoteca_stable.py
-scripts/
-  download_videoteca.py
-  download_videoteca_stable.py
-```
+- [Windows](docs/WINDOWS.md)
+- [Linux](docs/LINUX.md)
+- [macOS](docs/MACOS.md)
+- [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Dataset schema](docs/DATASET_SCHEMA.md)
 
-Video files are not stored in GitHub. Download them from Google Drive:
+## Quick Start
 
-```text
-DRIVE_LINK_HERE
-```
-
-Expected local video layout after download:
-
-```text
-outputs/videos/<category>/<vimeo_id>.mp4
-```
-
-## Verify SHA256
-
-After downloading videos into `outputs/videos/`, verify checksums:
+Clone and install:
 
 ```bash
-sha256sum -c release/videos.sha256
+git clone <REPO_URL>
+cd stop-piramida-dataset
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-## Download Videos Again
+Windows PowerShell activation:
 
-Use an already opened Chromium with CDP enabled:
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+Check your environment:
 
 ```bash
-chromium --remote-debugging-port=9222
+python scripts/download_videoteca.py --doctor
 ```
 
-Install dependencies:
+Start Chrome/Chromium with CDP enabled.
+
+Linux:
 
 ```bash
-python -m pip install -r requirements.txt
+chromium --remote-debugging-port=9222 --user-data-dir="$HOME/.chromium-stop-piramida"
 ```
 
-Download one category:
+Windows PowerShell:
+
+```powershell
+chrome.exe --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE.chromium-stop-piramida"
+```
+
+macOS:
 
 ```bash
-python scripts/download_videoteca.py --category lzheturizm --segment-workers 8
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222 --user-data-dir="$HOME/.chromium-stop-piramida"
 ```
 
-Download all categories:
+In another terminal, list categories:
+
+```bash
+python scripts/download_videoteca.py --list-categories
+```
+
+Download two videos from one category:
+
+```bash
+python scripts/download_videoteca.py --category lzheturizm --limit 2
+```
+
+## Full Download
 
 ```bash
 python scripts/download_videoteca.py --all --segment-workers 8
 ```
 
-Resume options:
-
-```bash
-python scripts/download_videoteca.py --all --limit 50 --start-after 1184398747 --segment-workers 8
-```
-
-## Google Drive Upload
-
-1. Open Google Cloud Console.
-2. Create or select a project.
-3. Enable Google Drive API.
-4. Go to APIs & Services -> Credentials.
-5. Create OAuth client ID credentials for a Desktop app.
-6. Download the JSON credentials file.
-7. Save it in the project root as `client_secrets.json`.
-
-Upload videos:
-
-```bash
-python scripts/upload_drive.py
-```
-
-The uploader creates a Drive folder named `Stop-Piramida Video Dataset`, skips already uploaded files by name and size, and writes the folder link to:
+Videos are saved to:
 
 ```text
-release/drive_link.txt
+outputs/videos/<category>/<vimeo_id>.mp4
 ```
 
-After upload, replace `DRIVE_LINK_HERE` in `README.md` and `release/README.md` with the generated link.
+Existing MP4 files are skipped by default, so rerunning the command resumes the download.
 
-## Prepare Release
+## Useful Commands
 
-Generate release metadata:
+Dry run:
 
 ```bash
-python scripts/prepare_release.py
+python scripts/download_videoteca.py --dry-run --category fishing --limit 3
 ```
 
-## GitHub Publish Commands
+Show missing local videos:
 
 ```bash
-git init
-git add README.md requirements.txt scripts data/metadata release .gitignore
-git commit -m "Add Stop-Piramida video dataset metadata and downloader"
-git branch -M main
-git remote add origin <REPO_URL>
-git push -u origin main
+python scripts/download_videoteca.py --missing
+```
+
+Verify downloaded MP4 files:
+
+```bash
+python scripts/download_videoteca.py --verify
+```
+
+Use a custom output directory:
+
+```bash
+python scripts/download_videoteca.py --all --output-dir outputs/videos
+```
+
+Resume after a Vimeo ID:
+
+```bash
+python scripts/download_videoteca.py --all --start-after 1184398747
+```
+
+## Refresh Metadata
+
+By default, the downloader reads:
+
+```text
+data/metadata/all_videos.jsonl
+```
+
+It does not re-parse the website unless you ask for it.
+
+Refresh all metadata:
+
+```bash
+python scripts/download_videoteca.py --refresh --all
+```
+
+Refresh one category:
+
+```bash
+python scripts/download_videoteca.py --refresh --category fishing
+```
+
+## How It Works
+
+The downloader does not use `yt-dlp`. It opens each Stop-Piramida `page_url`, starts the embedded Vimeo player, captures Vimeo `playlist.json`, downloads DASH video/audio segments, handles base64 `init_segment`, and merges tracks with `ffmpeg`.
+
+## Release Files
+
+The `release/` directory contains:
+
+- `videos.csv`
+- `missing_videos.txt`
+- `videos.sha256`
+- copied metadata and downloader scripts
+
+If you downloaded the maintainer archive, verify checksums:
+
+```bash
+sha256sum -c release/videos.sha256
 ```

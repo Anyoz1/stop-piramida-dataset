@@ -7,7 +7,7 @@ Dataset of public anti-fraud videos from Stop-Piramida.
 - Videos downloaded: 590
 - Missing videos: 3
 - Video archive size: 15GB
-- Google Drive video archive: DRIVE_LINK_HERE
+- Google Drive video archive: https://drive.google.com/drive/folders/1g-rahFj4oRNPTQQgXZv-EQ_I-lexgB20
 
 ## Categories
 
@@ -50,7 +50,7 @@ release/
 Video files are not stored in GitHub. Download them from Google Drive:
 
 ```text
-DRIVE_LINK_HERE
+https://drive.google.com/drive/folders/1g-rahFj4oRNPTQQgXZv-EQ_I-lexgB20
 ```
 
 Expected local layout:
@@ -95,7 +95,7 @@ python scripts/download_videoteca.py --category lzheturizm --segment-workers 8
 
 ## Google Drive Link
 
-After upload, replace `DRIVE_LINK_HERE` in `README.md` and `release/README.md` with the link saved in:
+After upload, replace `https://drive.google.com/drive/folders/1g-rahFj4oRNPTQQgXZv-EQ_I-lexgB20` in `README.md` and `release/README.md` with the link saved in:
 
 ```text
 release/drive_link.txt

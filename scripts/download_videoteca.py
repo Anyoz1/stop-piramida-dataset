@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import json
@@ -8,29 +9,28 @@ import re
 import requests
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-from playwright.sync_api import Browser, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
+from playwright.sync_api import Browser, Error as PlaywrightError, Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
 
 BASE_URL = "https://stop-piramida.kz/videos"
-CDP_URL = "http://127.0.0.1:9222"
+DEFAULT_CDP_URL = "http://127.0.0.1:9222"
 ROOT = Path(__file__).resolve().parents[1]
-METADATA_DIR = ROOT / "data" / "metadata"
-RAW_DIR = ROOT / "data" / "raw"
-VIDEOS_DIR = ROOT / "outputs" / "videos"
-ALL_VIDEOS_PATH = METADATA_DIR / "all_videos.jsonl"
-DOWNLOAD_STATUS_PATH = METADATA_DIR / "download_status.jsonl"
+DEFAULT_METADATA = ROOT / "data" / "metadata" / "all_videos.jsonl"
+DEFAULT_OUTPUT_DIR = ROOT / "outputs" / "videos"
+DEFAULT_RAW_DIR = ROOT / "data" / "raw"
 PAGE_TIMEOUT_MS = 30_000
 PLAYLIST_TIMEOUT_MS = 30_000
 DOWNLOAD_TIMEOUT_SEC = 30
 FFMPEG_TIMEOUT_SEC = 120
 
-CATEGORIES = [
+REFRESH_CATEGORIES = [
     "lzheturizm",
     "lzhezarabotok",
     "stop-mfo",
@@ -49,15 +49,25 @@ CATEGORIES = [
     "riski-v-setevom-marketinge",
     "finansovyie-piramidyi",
 ]
+
 _PLAYWRIGHT = None
+_THREAD_LOCAL = threading.local()
 
 
-def connect_browser(cdp_url: str = CDP_URL) -> Browser:
+def connect_browser(cdp_url: str = DEFAULT_CDP_URL) -> Browser:
     global _PLAYWRIGHT
     playwright = sync_playwright().start()
     _PLAYWRIGHT = playwright
-    browser = playwright.chromium.connect_over_cdp(cdp_url)
-    return browser
+    try:
+        return playwright.chromium.connect_over_cdp(cdp_url)
+    except PlaywrightError as exc:
+        playwright.stop()
+        _PLAYWRIGHT = None
+        raise RuntimeError(
+            "Chromium CDP is not available.\n"
+            f"{browser_start_help()}\n"
+            f"Then rerun this script. CDP URL: {cdp_url}"
+        ) from exc
 
 
 def load_category(page: Page, category: str) -> None:
@@ -71,19 +81,14 @@ def load_category(page: Page, category: str) -> None:
 
     previous_count = -1
     stagnant_clicks = 0
-
     while True:
         cards_count = page.locator(".videoBoxHover").count()
-        if cards_count == previous_count:
-            stagnant_clicks += 1
-        else:
-            stagnant_clicks = 0
+        stagnant_clicks = stagnant_clicks + 1 if cards_count == previous_count else 0
         previous_count = cards_count
 
         button = _find_show_more_button(page)
         if button is None or stagnant_clicks >= 2:
             return
-
         try:
             button.scroll_into_view_if_needed(timeout=5_000)
             button.click(timeout=10_000)
@@ -110,18 +115,18 @@ def extract_videos(page: Page, category: str) -> list[dict[str, str]]:
             vimeo_id: (vimeoUrl.match(/vimeo\\.com\\/(?:video\\/)?(\\d+)/) || [])[1] || ''
           };
         })
-        """
-        ,
+        """,
         category,
     )
 
     seen: set[str] = set()
     deduped: list[dict[str, str]] = []
     for item in items:
-        key = item.get("vimeo_id") or item.get("page_url")
+        normalized = normalize_video(item)
+        key = normalized.get("vimeo_id") or normalized.get("page_url")
         if key and key not in seen:
             seen.add(key)
-            deduped.append(item)
+            deduped.append(normalized)
     return deduped
 
 
@@ -150,13 +155,13 @@ def get_playlist(page: Page, video: dict[str, str], timeout_ms: int = PLAYLIST_T
             _start_vimeo_playback(page, video)
         response = response_info.value
         return response.json(), response.url
-    except PlaywrightTimeoutError:
+    except PlaywrightTimeoutError as exc:
         deadline = time.time() + timeout_ms / 1000
         while time.time() < deadline:
             if playlist_responses:
                 return playlist_responses[-1]
             page.wait_for_timeout(500)
-        raise RuntimeError("playlist.json was not captured")
+        raise RuntimeError(f"Vimeo playlist timeout for {page_url}") from exc
     finally:
         page.remove_listener("response", on_response)
 
@@ -166,7 +171,7 @@ def select_best_stream(playlist: dict[str, Any], playlist_url: str = "") -> dict
     if not streams:
         streams = _extract_streams_recursively(playlist)
     if not streams:
-        raise RuntimeError("playlist contains no video streams")
+        raise RuntimeError("Vimeo playlist contains no video streams")
 
     video_stream = max(
         streams,
@@ -210,7 +215,8 @@ def merge_segments(downloaded: dict[str, Any], output_path: Path) -> float:
         raise RuntimeError("video fragments were not downloaded")
 
     tmp_output = output_path.with_name(f"{output_path.stem}.part{output_path.suffix}")
-    if audio_path and shutil.which("ffmpeg"):
+    if audio_path:
+        require_ffmpeg()
         command = [
             "ffmpeg",
             "-hide_banner",
@@ -238,7 +244,7 @@ def save_metadata(video: dict[str, Any], playlist_info: dict[str, Any], output_p
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         **video,
-        "mp4_path": str(output_path.relative_to(ROOT)),
+        "mp4_path": str(output_path),
         "playlist_url": playlist_info.get("playlist_url", ""),
         "selected_video": _stream_metadata(playlist_info["video"]),
         "selected_audio": _stream_metadata(playlist_info["audio"]) if playlist_info.get("audio") else None,
@@ -248,46 +254,98 @@ def save_metadata(video: dict[str, Any], playlist_info: dict[str, Any], output_p
 
 def main() -> None:
     args = _parse_args()
-    _ensure_dirs()
-    categories = CATEGORIES if args.all else [args.category]
+    metadata_path = Path(args.metadata)
+    output_dir = Path(args.output_dir)
+    status_path = metadata_path.parent / "download_status.jsonl"
+    raw_dir = DEFAULT_RAW_DIR
 
+    try:
+        if args.doctor:
+            run_doctor(args.cdp_url, metadata_path, output_dir)
+            return
+
+        if args.refresh:
+            videos = refresh_metadata(args, metadata_path)
+        else:
+            videos = read_metadata(metadata_path)
+
+        if args.list_categories:
+            print_categories(videos)
+            return
+        if args.missing:
+            print_missing(videos, output_dir, args.category)
+            return
+        if args.verify:
+            verify_videos(videos, output_dir, args.category)
+            return
+
+        if not args.all and not args.category:
+            raise SystemExit("Choose --category CATEGORY, --all, --list-categories, --missing, or --verify.")
+
+        selected = select_videos(videos, category=args.category, all_videos=args.all, start_after=args.start_after)
+        if args.limit is not None:
+            selected = selected[: args.limit]
+
+        if args.dry_run:
+            dry_run(selected, output_dir)
+            return
+
+        require_writable(output_dir)
+        require_ffmpeg()
+        download_videos(selected, args, output_dir, raw_dir, status_path)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        raise SystemExit(130)
+    except RuntimeError as exc:
+        print(f"[!] {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def refresh_metadata(args: argparse.Namespace, metadata_path: Path) -> list[dict[str, str]]:
+    categories = [args.category] if args.category else REFRESH_CATEGORIES
     browser = connect_browser(args.cdp_url)
     try:
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.new_page()
-        all_videos: list[dict[str, str]] = []
-
+        videos: list[dict[str, str]] = []
         for category in categories:
-            print(f"[+] Loading category {category}")
+            print(f"[+] Refreshing category {category}")
             load_category(page, category)
-            videos = extract_videos(page, category)
-            _save_category_index(category, videos)
-            all_videos.extend(videos)
-            print(f"[✓] Indexed {len(videos)} videos in {category}")
+            category_videos = extract_videos(page, category)
+            _save_category_index(metadata_path.parent, category, category_videos)
+            videos.extend(category_videos)
+            print(f"[✓] Indexed {len(category_videos)} videos in {category}")
+        _save_all_index(metadata_path, videos)
+        print(f"[✓] Saved metadata -> {metadata_path}")
+        return videos
+    finally:
+        close_browser(browser)
 
-        _save_all_index(all_videos)
-        print(f"[✓] Saved combined index -> {ALL_VIDEOS_PATH.relative_to(ROOT)}")
 
-        all_videos = _apply_start_after(all_videos, args.start_after)
-        total = len(all_videos)
-        attempted_new = 0
-        for index, video in enumerate(all_videos, start=1):
+def download_videos(
+    videos: list[dict[str, str]],
+    args: argparse.Namespace,
+    output_dir: Path,
+    raw_dir: Path,
+    status_path: Path,
+) -> None:
+    browser = connect_browser(args.cdp_url)
+    try:
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = context.new_page()
+        total = len(videos)
+        if total == 0:
+            print("Nothing to download.")
+            return
+
+        for index, video in enumerate(videos, start=1):
             category = video["category"]
-            vimeo_id = video.get("vimeo_id") or _extract_vimeo_id(video.get("vimeo_url", ""))
-            if not vimeo_id:
-                print(f"[!] Failed [{index}/{total}] {video.get('title', '')}: no Vimeo id")
-                _write_status(video, "failed", "", "no Vimeo id")
-                continue
-
-            output_path = VIDEOS_DIR / category / f"{vimeo_id}.mp4"
+            vimeo_id = video["vimeo_id"]
+            output_path = output_dir / category / f"{vimeo_id}.mp4"
             if args.skip_existing and output_path.exists() and output_path.stat().st_size > 0:
-                print(f"[{index}/{total}] Skipping existing {output_path.relative_to(ROOT)}")
-                _write_status(video, "ok", output_path, "skipped existing")
+                print(f"[{index}/{total}] Skipping existing {output_path}")
+                _write_status(status_path, video, "ok", output_path, "skipped existing")
                 continue
-
-            if args.limit is not None and attempted_new >= args.limit:
-                break
-            attempted_new += 1
 
             print(f"[{index}/{total}] Downloading {category}/{vimeo_id} ...")
             try:
@@ -297,8 +355,8 @@ def main() -> None:
                 playlist_seconds = time.perf_counter() - playlist_start
                 print(f"playlist: {playlist_seconds:.1f}s")
                 playlist_info = select_best_stream(playlist, playlist_url)
-                _save_raw_playlist(category, vimeo_id, playlist)
-                work_dir = RAW_DIR / "segments" / category / vimeo_id
+                _save_raw_playlist(raw_dir, category, vimeo_id, playlist)
+                work_dir = raw_dir / "segments" / category / vimeo_id
                 downloaded = download_segments(playlist_info, work_dir, args.segment_workers)
                 segment_mb = downloaded["bytes"] / 1024 / 1024
                 segment_speed = segment_mb / downloaded["seconds"] if downloaded["seconds"] else 0
@@ -309,67 +367,284 @@ def main() -> None:
                 output_mb = output_path.stat().st_size / 1024 / 1024
                 total_seconds = time.perf_counter() - total_start
                 total_speed = output_mb / total_seconds if total_seconds else 0
-                _write_status(video, "ok", output_path, "")
-                print(f"[✓] Saved {output_path.relative_to(ROOT)} ({output_mb:.1f} MB, avg {total_speed:.2f} MB/s)")
+                _write_status(status_path, video, "ok", output_path, "")
+                print(f"[✓] Saved {output_path} ({output_mb:.1f} MB, avg {total_speed:.2f} MB/s)")
             except Exception as exc:
-                _write_status(video, "failed", output_path, str(exc))
+                _write_status(status_path, video, "failed", output_path, str(exc))
                 print(f"[!] Failed {category}/{vimeo_id}: {exc}")
     finally:
-        try:
-            browser.close()
-        finally:
-            if _PLAYWRIGHT:
-                _PLAYWRIGHT.stop()
+        close_browser(browser)
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Download stop-piramida.kz video library via Playwright and Vimeo playlist.json.")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--category", choices=CATEGORIES, help="download one category")
-    group.add_argument("--all", action="store_true", help="download all known categories")
-    parser.add_argument("--cdp-url", default=CDP_URL, help=f"Chromium CDP URL, default: {CDP_URL}")
-    parser.add_argument("--limit", type=int, help="download only N new videos")
-    parser.add_argument("--start-after", help="start after this Vimeo id")
-    parser.add_argument("--segment-workers", type=int, default=8, help="parallel segment workers per audio/video track")
-    parser.add_argument("--skip-existing", action=argparse.BooleanOptionalAction, default=True, help="skip existing mp4 files")
-    return parser.parse_args()
-
-
-def _ensure_dirs() -> None:
-    for path in (METADATA_DIR, RAW_DIR, ROOT / "data" / "transcripts", VIDEOS_DIR):
-        path.mkdir(parents=True, exist_ok=True)
-
-
-def _apply_start_after(videos: list[dict[str, str]], start_after: str | None) -> list[dict[str, str]]:
-    if not start_after:
-        return videos
-    for index, video in enumerate(videos):
-        vimeo_id = video.get("vimeo_id") or _extract_vimeo_id(video.get("vimeo_url", ""))
-        if vimeo_id == start_after:
-            return videos[index + 1 :]
+def read_metadata(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        raise RuntimeError(
+            f"Metadata file not found: {path}\n"
+            "Run with --refresh to rebuild metadata, or pass --metadata PATH."
+        )
+    videos: list[dict[str, str]] = []
+    with path.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if not line.strip():
+                continue
+            try:
+                videos.append(normalize_video(json.loads(line)))
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"Invalid JSONL metadata at {path}:{line_number}: {exc}") from exc
+    if not videos:
+        raise RuntimeError(f"Metadata file is empty: {path}")
     return videos
 
 
-def _write_status(video: dict[str, Any], status: str, file_path: Path | str, error: str) -> None:
-    DOWNLOAD_STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    path_text = ""
-    if file_path:
-        path = Path(file_path)
-        try:
-            path_text = str(path.relative_to(ROOT)) if path.is_absolute() else str(path)
-        except ValueError:
-            path_text = str(path)
-
-    payload = {
-        "vimeo_id": video.get("vimeo_id") or _extract_vimeo_id(video.get("vimeo_url", "")),
-        "category": video.get("category", ""),
-        "status": status,
-        "file": path_text,
-        "error": error,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+def normalize_video(item: dict[str, Any]) -> dict[str, str]:
+    vimeo_url = item.get("vimeo_url") or item.get("vimeo") or ""
+    page_url = item.get("page_url") or item.get("url") or ""
+    vimeo_id = item.get("vimeo_id") or _extract_vimeo_id(vimeo_url)
+    return {
+        "category": item.get("category") or "",
+        "title": item.get("title") or "",
+        "description": item.get("description") or "",
+        "page_url": page_url,
+        "vimeo_url": vimeo_url,
+        "vimeo_id": vimeo_id,
     }
-    with DOWNLOAD_STATUS_PATH.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def select_videos(videos: list[dict[str, str]], category: str | None, all_videos: bool, start_after: str | None) -> list[dict[str, str]]:
+    selected = videos if all_videos else [video for video in videos if video["category"] == category]
+    if category and not selected:
+        available = ", ".join(sorted({video["category"] for video in videos}))
+        raise RuntimeError(f"Category not found in metadata: {category}\nAvailable categories: {available}")
+    return _apply_start_after(selected, start_after)
+
+
+def print_categories(videos: list[dict[str, str]]) -> None:
+    counts = Counter(video["category"] for video in videos)
+    for category in sorted(counts):
+        print(f"{category}\t{counts[category]}")
+    print(f"TOTAL\t{sum(counts.values())}")
+
+
+def print_missing(videos: list[dict[str, str]], output_dir: Path, category: str | None) -> None:
+    selected = [video for video in videos if category is None or video["category"] == category]
+    missing = [video for video in selected if not video_path(output_dir, video).exists()]
+    for video in missing:
+        print(f"{video['category']}\t{video['vimeo_id']}\t{video['title']}")
+    print(f"Missing: {len(missing)} / {len(selected)}")
+
+
+def dry_run(videos: list[dict[str, str]], output_dir: Path) -> None:
+    for video in videos:
+        exists = video_path(output_dir, video).exists()
+        marker = "exists" if exists else "new"
+        print(f"{marker}\t{video['category']}\t{video['vimeo_id']}\t{video['title']}")
+    print(f"Would process: {len(videos)} videos")
+
+
+def verify_videos(videos: list[dict[str, str]], output_dir: Path, category: str | None) -> None:
+    if not shutil.which("ffprobe"):
+        raise RuntimeError("ffprobe not found. Install ffmpeg to use --verify.")
+    selected = [video for video in videos if category is None or video["category"] == category]
+    checked = 0
+    failed = 0
+    missing = 0
+    for video in selected:
+        path = video_path(output_dir, video)
+        if not path.exists():
+            missing += 1
+            print(f"[missing] {path}")
+            continue
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", str(path)],
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        checked += 1
+        if result.returncode:
+            failed += 1
+            print(f"[failed] {path}: {result.stderr.strip()}")
+        else:
+            print(f"[ok] {path}")
+    print(f"Verify complete: ok={checked - failed}, failed={failed}, missing={missing}")
+
+
+def require_ffmpeg() -> None:
+    if not shutil.which("ffmpeg"):
+        raise RuntimeError("ffmpeg not found. Install ffmpeg and ensure it is available in PATH.")
+
+
+def require_writable(path: Path) -> None:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        test_path = path / ".write_test"
+        test_path.write_text("ok", encoding="utf-8")
+        test_path.unlink()
+    except OSError as exc:
+        raise RuntimeError(f"No write permission for output directory: {path}") from exc
+
+
+def run_doctor(cdp_url: str = DEFAULT_CDP_URL, metadata_path: Path = DEFAULT_METADATA, output_dir: Path = DEFAULT_OUTPUT_DIR) -> bool:
+    ok = True
+    print("Stop-Piramida downloader environment check")
+    print()
+
+    if sys.version_info >= (3, 10):
+        print(f"[OK] Python version: {sys.version.split()[0]}")
+    else:
+        print(f"[FAIL] Python version: {sys.version.split()[0]} (Python 3.10+ recommended)")
+        ok = False
+
+    ok &= _doctor_which("ffmpeg", required=True)
+    ok &= _doctor_which("ffprobe", required=True)
+
+    browser = find_browser_binary()
+    if browser:
+        print(f"[OK] Chromium/Chrome found: {browser}")
+    else:
+        print("[WARN] Chromium/Chrome was not found in PATH or common install locations.")
+
+    try:
+        import playwright  # noqa: F401
+
+        print("[OK] Playwright installed")
+    except Exception as exc:
+        print(f"[FAIL] Playwright import failed: {exc}")
+        ok = False
+
+    if check_cdp(cdp_url):
+        print(f"[OK] CDP available: {cdp_url}")
+    else:
+        print(f"[FAIL] CDP not available: {cdp_url}")
+        print(f"[INFO] Start browser with:\n{browser_start_help()}")
+        ok = False
+
+    if metadata_path.exists():
+        print(f"[OK] metadata exists: {metadata_path}")
+    else:
+        print(f"[FAIL] metadata not found: {metadata_path}")
+        print("[INFO] Use --refresh to rebuild metadata if you have browser CDP running.")
+        ok = False
+
+    if check_writable(output_dir):
+        print(f"[OK] output directory writable: {output_dir}")
+    else:
+        print(f"[FAIL] output directory is not writable: {output_dir}")
+        ok = False
+
+    print()
+    print("[OK] Doctor passed" if ok else "[FAIL] Doctor found issues")
+    return ok
+
+
+def _doctor_which(name: str, required: bool) -> bool:
+    path = shutil.which(name)
+    if path:
+        print(f"[OK] {name} found: {path}")
+        return True
+    status = "FAIL" if required else "WARN"
+    print(f"[{status}] {name} not found in PATH")
+    return not required
+
+
+def find_browser_binary() -> str | None:
+    candidates = [
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+        "chrome",
+        "chrome.exe",
+        "msedge",
+        "msedge.exe",
+    ]
+    for candidate in candidates:
+        found = shutil.which(candidate)
+        if found:
+            return found
+
+    common_paths = [
+        Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+        Path("C:/Program Files/Google/Chrome/Application/chrome.exe"),
+        Path("C:/Program Files (x86)/Google/Chrome/Application/chrome.exe"),
+        Path.home() / "AppData/Local/Google/Chrome/Application/chrome.exe",
+    ]
+    for path in common_paths:
+        if path.exists():
+            return str(path)
+    return None
+
+
+def check_cdp(cdp_url: str) -> bool:
+    global _PLAYWRIGHT
+    playwright = sync_playwright().start()
+    try:
+        browser = playwright.chromium.connect_over_cdp(cdp_url, timeout=3_000)
+        browser.close()
+        return True
+    except Exception:
+        return False
+    finally:
+        playwright.stop()
+        _PLAYWRIGHT = None
+
+
+def check_writable(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        test_path = path / ".write_test"
+        test_path.write_text("ok", encoding="utf-8")
+        test_path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def browser_start_help() -> str:
+    return "\n".join(
+        [
+            "Linux:",
+            '  chromium --remote-debugging-port=9222 --user-data-dir="$HOME/.chromium-stop-piramida"',
+            "Windows PowerShell:",
+            '  chrome.exe --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE.chromium-stop-piramida"',
+            "macOS:",
+            '  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --remote-debugging-port=9222 --user-data-dir="$HOME/.chromium-stop-piramida"',
+        ]
+    )
+
+
+def close_browser(browser: Browser) -> None:
+    try:
+        browser.close()
+    finally:
+        global _PLAYWRIGHT
+        if _PLAYWRIGHT:
+            _PLAYWRIGHT.stop()
+            _PLAYWRIGHT = None
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Download the stop-piramida.kz video dataset using Playwright and Vimeo playlist.json.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--list-categories", action="store_true", help="show categories and video counts")
+    parser.add_argument("--category", help="download or inspect one category")
+    parser.add_argument("--all", action="store_true", help="download or inspect all categories")
+    parser.add_argument("--refresh", action="store_true", help="re-parse stop-piramida.kz and update metadata")
+    parser.add_argument("--limit", type=int, help="download or show only N videos")
+    parser.add_argument("--start-after", help="start after this Vimeo id")
+    parser.add_argument("--segment-workers", type=int, default=8, help="parallel segment workers per audio/video track")
+    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="directory for downloaded mp4 files")
+    parser.add_argument("--metadata", default=str(DEFAULT_METADATA), help="metadata JSONL path")
+    parser.add_argument("--dry-run", action="store_true", help="show what would be downloaded without downloading")
+    parser.add_argument("--verify", action="store_true", help="verify local mp4 files with ffprobe")
+    parser.add_argument("--missing", action="store_true", help="show videos present in metadata but missing locally")
+    parser.add_argument("--doctor", action="store_true", help="check local environment and print setup hints")
+    parser.add_argument("--cdp-url", default=DEFAULT_CDP_URL, help="Chromium CDP URL")
+    parser.add_argument("--skip-existing", action=argparse.BooleanOptionalAction, default=True, help="skip existing mp4 files")
+    return parser.parse_args()
 
 
 def _find_show_more_button(page: Page) -> Any | None:
@@ -491,9 +766,6 @@ def _normalize_stream_urls(stream: dict[str, Any], playlist_base: str) -> dict[s
     }
 
 
-_THREAD_LOCAL = threading.local()
-
-
 def _download_stream_fragments(stream: dict[str, Any], target_dir: Path, segment_workers: int) -> Path:
     target_dir.mkdir(parents=True, exist_ok=True)
     output_path = target_dir.with_suffix(".mp4")
@@ -520,7 +792,6 @@ def _download_stream_segments_parallel(
 ) -> list[Path]:
     if not urls:
         return []
-
     workers = max(1, segment_workers)
     results: list[Path | None] = [None] * len(urls)
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -531,7 +802,6 @@ def _download_stream_segments_parallel(
         for future in as_completed(futures):
             index, path = future.result()
             results[index] = path
-
     return [path for path in results if path is not None]
 
 
@@ -540,7 +810,6 @@ def _decode_init_segment(init_segment: Any) -> bytes:
         return init_segment
     if not isinstance(init_segment, str):
         raise RuntimeError(f"unsupported init_segment type: {type(init_segment).__name__}")
-
     payload = init_segment.strip()
     if payload.startswith("range/prot/"):
         payload = payload[len("range/prot/") :]
@@ -576,7 +845,7 @@ def _download_url(url: str, path: Path, headers: dict[str, str], retries: int = 
             last_error = exc
             if attempt < retries:
                 time.sleep(1.5 * attempt)
-    raise RuntimeError(f"download failed: {url}: {last_error}")
+    raise RuntimeError(f"segment download failed after {retries} retries: {url}: {last_error}")
 
 
 def _get_session() -> requests.Session:
@@ -587,26 +856,46 @@ def _get_session() -> requests.Session:
     return session
 
 
-def _save_category_index(category: str, videos: list[dict[str, str]]) -> None:
-    path = METADATA_DIR / f"{category}.jsonl"
+def _apply_start_after(videos: list[dict[str, str]], start_after: str | None) -> list[dict[str, str]]:
+    if not start_after:
+        return videos
+    for index, video in enumerate(videos):
+        if video.get("vimeo_id") == start_after:
+            return videos[index + 1 :]
+    return videos
+
+
+def _write_status(status_path: Path, video: dict[str, Any], status: str, file_path: Path | str, error: str) -> None:
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "vimeo_id": video.get("vimeo_id") or _extract_vimeo_id(video.get("vimeo_url", "")),
+        "category": video.get("category", ""),
+        "status": status,
+        "file": str(file_path) if file_path else "",
+        "error": error,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    with status_path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _save_category_index(metadata_dir: Path, category: str, videos: list[dict[str, str]]) -> None:
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    path = metadata_dir / f"{category}.jsonl"
     with path.open("w", encoding="utf-8") as file:
         for video in videos:
             file.write(json.dumps(video, ensure_ascii=False) + "\n")
 
 
-def _save_all_index(videos: list[dict[str, str]]) -> None:
-    seen: set[str] = set()
-    with ALL_VIDEOS_PATH.open("w", encoding="utf-8") as file:
+def _save_all_index(path: Path, videos: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as file:
         for video in videos:
-            key = video.get("vimeo_id") or video.get("page_url") or json.dumps(video, sort_keys=True)
-            if key in seen:
-                continue
-            seen.add(key)
             file.write(json.dumps(video, ensure_ascii=False) + "\n")
 
 
-def _save_raw_playlist(category: str, vimeo_id: str, playlist: dict[str, Any]) -> None:
-    path = RAW_DIR / "playlists" / category / f"{vimeo_id}.json"
+def _save_raw_playlist(raw_dir: Path, category: str, vimeo_id: str, playlist: dict[str, Any]) -> None:
+    path = raw_dir / "playlists" / category / f"{vimeo_id}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(playlist, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -620,6 +909,10 @@ def _extract_vimeo_id(url: str) -> str:
     parsed = urlparse(url)
     match = re.search(r"/(?:video/)?(\d+)", parsed.path)
     return match.group(1) if match else ""
+
+
+def video_path(output_dir: Path, video: dict[str, str]) -> Path:
+    return output_dir / video["category"] / f"{video['vimeo_id']}.mp4"
 
 
 if __name__ == "__main__":
