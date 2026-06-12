@@ -1,0 +1,13 @@
+.venv/
+outputs/videos/
+*.mp4
+*.part
+data/raw/
+__pycache__/
+.env
+client_secret*.json
+client_secrets.json
+token*.json
+*.tar
+*.tar.gz
+download_all.log
