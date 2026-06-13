@@ -150,6 +150,7 @@ def get_playlist(page: Page, video: dict[str, str], timeout_ms: int = PLAYLIST_T
     page.on("response", on_response)
     try:
         with page.expect_response(lambda r: "playlist.json" in r.url, timeout=timeout_ms) as response_info:
+            print("PLAYLIST WAITING")
             print(f"OPEN PAGE: {page_url}")
             page.goto(page_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
             _start_vimeo_playback(page, video)
@@ -669,31 +670,111 @@ def _find_show_more_button(page: Page) -> Any | None:
 
 
 def _start_vimeo_playback(page: Page, video: dict[str, str]) -> None:
-    found_iframe = _log_vimeo_iframe(page, timeout_ms=3_000)
+    vimeo_id = video.get("vimeo_id") or _extract_vimeo_id(video.get("vimeo_url", ""))
+    if _log_vimeo_iframe(page, timeout_ms=1_000, vimeo_id=vimeo_id):
+        return
 
-    for locator in [
-        page.locator(".videoBoxHover").first,
-        page.locator(".videoBox").first,
-        page.locator("[data-v-url*='vimeo.com']").first,
-        page.get_by_role("button", name=re.compile("play|воспроизвести", re.I)).first,
-        page.locator("iframe[src*='vimeo.com']").first,
-    ]:
+    block = _find_video_block(page, vimeo_id)
+    if block is not None:
+        print("VIDEO BLOCK FOUND")
         try:
-            if locator.count() and locator.is_visible(timeout=2_000):
-                locator.scroll_into_view_if_needed(timeout=2_000)
-                locator.click(timeout=5_000)
-                break
+            block.scroll_into_view_if_needed(timeout=5_000)
+        except Exception:
+            pass
+
+        try:
+            print("CLICK FORCE")
+            block.click(timeout=7_000, force=True)
+        except Exception:
+            try:
+                print("CLICK JS")
+                page.evaluate("(el) => el.click()", block)
+            except Exception:
+                pass
+
+        if _wait_for_vimeo_iframe(page, vimeo_id, timeout_ms=7_000):
+            return
+
+    _inject_vimeo_iframe(page, vimeo_id)
+    _wait_for_vimeo_iframe(page, vimeo_id, timeout_ms=7_000)
+
+
+def _find_video_block(page: Page, vimeo_id: str) -> Any | None:
+    selectors = []
+    if vimeo_id:
+        selectors.extend(
+            [
+                f".videoBoxHover[data-v-url*='{vimeo_id}']",
+                f"[data-v-url*='vimeo.com/{vimeo_id}']",
+                f"[data-v-url*='{vimeo_id}']",
+            ]
+        )
+    selectors.extend(
+        [
+            ".videoBoxHover",
+            ".videoBox",
+            "[data-v-url*='vimeo.com']",
+        ]
+    )
+
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count():
+                return locator
         except Exception:
             continue
-
-    if not found_iframe:
-        page.wait_for_timeout(1_000)
-        _log_vimeo_iframe(page, timeout_ms=500)
+    return None
 
 
-def _log_vimeo_iframe(page: Page, timeout_ms: int) -> bool:
+def _wait_for_vimeo_iframe(page: Page, vimeo_id: str, timeout_ms: int) -> bool:
+    if vimeo_id:
+        selector = f"iframe[src*='player.vimeo.com/video/{vimeo_id}']"
+    else:
+        selector = "iframe[src*='player.vimeo.com']"
+
     try:
-        iframe = page.wait_for_selector("iframe[src*='vimeo.com']", timeout=timeout_ms)
+        iframe = page.wait_for_selector(selector, timeout=timeout_ms)
+        src = iframe.get_attribute("src") or ""
+        print(f"FOUND IFRAME: {src}")
+        return True
+    except PlaywrightTimeoutError:
+        return _log_vimeo_iframe(page, timeout_ms=500, vimeo_id=vimeo_id)
+
+
+def _inject_vimeo_iframe(page: Page, vimeo_id: str) -> None:
+    if not vimeo_id:
+        return
+    iframe_url = f"https://player.vimeo.com/video/{vimeo_id}?color=fdbb03&autoplay=1&app_id=122963"
+    page.evaluate(
+        """
+        (src) => {
+          let container = document.querySelector('#unified-player-container');
+          if (!container) {
+            container = document.createElement('div');
+            container.id = 'unified-player-container';
+            document.body.prepend(container);
+          }
+          container.innerHTML = '';
+          const iframe = document.createElement('iframe');
+          iframe.src = src;
+          iframe.allow = 'autoplay; fullscreen; picture-in-picture';
+          iframe.setAttribute('allowfullscreen', '');
+          iframe.style.width = '960px';
+          iframe.style.height = '540px';
+          iframe.style.border = '0';
+          container.appendChild(iframe);
+        }
+        """,
+        iframe_url,
+    )
+    print("IFRAME INJECTED")
+
+
+def _log_vimeo_iframe(page: Page, timeout_ms: int, vimeo_id: str = "") -> bool:
+    selector = f"iframe[src*='player.vimeo.com/video/{vimeo_id}']" if vimeo_id else "iframe[src*='vimeo.com']"
+    try:
+        iframe = page.wait_for_selector(selector, timeout=timeout_ms)
         src = iframe.get_attribute("src") or ""
         print(f"FOUND IFRAME: {src}")
         return True
@@ -701,7 +782,7 @@ def _log_vimeo_iframe(page: Page, timeout_ms: int) -> bool:
         pass
 
     for frame in page.frames:
-        if "vimeo.com" in frame.url:
+        if "vimeo.com" in frame.url and (not vimeo_id or vimeo_id in frame.url):
             print(f"FOUND IFRAME: {frame.url}")
             return True
 
