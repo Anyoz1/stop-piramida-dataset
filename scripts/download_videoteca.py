@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -264,6 +265,7 @@ def merge_segments(downloaded: dict[str, Any], output_path: Path) -> float:
         shutil.copyfile(video_path, tmp_output)
 
     tmp_output.replace(output_path)
+    verify_mp4(output_path)
     return time.perf_counter() - start
 
 
@@ -469,7 +471,7 @@ def process_one_video(
         print(f"{prefix} playlist: {playlist_seconds:.1f}s")
         playlist_info = select_best_stream(playlist, playlist_url)
         _save_raw_playlist(raw_dir, category, vimeo_id, playlist)
-        work_dir = raw_dir / "segments" / category / vimeo_id
+        work_dir = make_video_work_dir(raw_dir, category, vimeo_id, worker_id)
         downloaded = download_segments(playlist_info, work_dir, args.segment_workers)
         segment_mb = downloaded["bytes"] / 1024 / 1024
         segment_speed = segment_mb / downloaded["seconds"] if downloaded["seconds"] else 0
@@ -477,12 +479,18 @@ def process_one_video(
         ffmpeg_seconds = merge_segments(downloaded, output_path)
         print(f"{prefix} ffmpeg: {ffmpeg_seconds:.1f}s")
         save_metadata(video, playlist_info, output_path)
+        if args.clean_temp_on_success:
+            shutil.rmtree(work_dir, ignore_errors=True)
         output_mb = output_path.stat().st_size / 1024 / 1024
         total_seconds = time.perf_counter() - total_start
         total_speed = output_mb / total_seconds if total_seconds else 0
         _write_status(status_path, video, "ok", output_path, "")
         print(f"[W{worker_id} ✓] Saved {output_path} ({output_mb:.1f} MB, avg {total_speed:.2f} MB/s)")
     except Exception as exc:
+        if output_path.exists():
+            output_path.unlink()
+        if "work_dir" in locals():
+            preserve_failed_segments(work_dir, raw_dir, category, vimeo_id, args.keep_temp_on_fail)
         _write_status(status_path, video, "failed", output_path, str(exc))
         print(f"[W{worker_id} !] Failed {category}/{vimeo_id}: {exc}")
 
@@ -593,6 +601,43 @@ def require_writable(path: Path) -> None:
         test_path.unlink()
     except OSError as exc:
         raise RuntimeError(f"No write permission for output directory: {path}") from exc
+
+
+def make_video_work_dir(raw_dir: Path, category: str, vimeo_id: str, worker_id: int) -> Path:
+    timestamp = int(time.time() * 1000)
+    path = raw_dir / "segments" / category / f"{vimeo_id}.{os.getpid()}.{worker_id}.{timestamp}"
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def preserve_failed_segments(work_dir: Path, raw_dir: Path, category: str, vimeo_id: str, keep_temp_on_fail: bool) -> None:
+    if not keep_temp_on_fail or not work_dir.exists():
+        return
+    failed_root = raw_dir / "failed_segments" / category
+    failed_root.mkdir(parents=True, exist_ok=True)
+    destination = failed_root / f"{vimeo_id}.{work_dir.name}"
+    counter = 1
+    while destination.exists():
+        destination = failed_root / f"{vimeo_id}.{work_dir.name}.{counter}"
+        counter += 1
+    work_dir.replace(destination)
+    print(f"[INFO] Failed segments preserved: {destination}")
+
+
+def verify_mp4(path: Path) -> None:
+    if not shutil.which("ffprobe"):
+        raise RuntimeError("ffprobe not found. Install ffmpeg to verify merged mp4 files.")
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", str(path)],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    if result.returncode != 0 or result.stderr.strip():
+        message = result.stderr.strip() or f"ffprobe exited with {result.returncode}"
+        if path.exists():
+            path.unlink()
+        raise RuntimeError(f"ffprobe validation failed for {path}: {message}")
 
 
 def run_doctor(cdp_url: str = DEFAULT_CDP_URL, metadata_path: Path = DEFAULT_METADATA, output_dir: Path = DEFAULT_OUTPUT_DIR) -> bool:
@@ -748,6 +793,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--start-after", help="start after this Vimeo id")
     parser.add_argument("--video-workers", type=int, default=1, help="parallel video workers, each with its own Playwright context/page")
     parser.add_argument("--segment-workers", type=int, default=8, help="parallel segment workers per audio/video track")
+    parser.add_argument("--keep-temp-on-fail", action=argparse.BooleanOptionalAction, default=True, help="keep failed segment temp directories for debugging")
+    parser.add_argument("--clean-temp-on-success", action=argparse.BooleanOptionalAction, default=True, help="delete per-video temp segment directory after successful merge")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="directory for downloaded mp4 files")
     parser.add_argument("--metadata", default=str(DEFAULT_METADATA), help="metadata JSONL path")
     parser.add_argument("--dry-run", action="store_true", help="show what would be downloaded without downloading")
@@ -952,21 +999,34 @@ def _normalize_stream_urls(stream: dict[str, Any], playlist_base: str) -> dict[s
         init_segment_url = urljoin(base_url, init_segment_url)
         print("INIT SEGMENT: url")
 
-    segment_urls = [
-        urljoin(base_url, segment["url"] if isinstance(segment, dict) else str(segment))
-        for segment in segments
-    ]
-    urls = []
+    absolute_segments = []
+    for segment in segments:
+        if isinstance(segment, dict):
+            segment_url = segment["url"]
+            expected_size = segment.get("size")
+        else:
+            segment_url = str(segment)
+            expected_size = None
+        absolute_segments.append(
+            {
+                "url": urljoin(base_url, segment_url),
+                "size": int(expected_size) if expected_size else None,
+            }
+        )
+    segment_urls = [segment["url"] for segment in absolute_segments]
+    absolute_downloads = []
     if init_segment_url:
-        urls.append(init_segment_url)
-    urls.extend(segment_urls)
+        absolute_downloads.append({"url": init_segment_url, "size": None})
+    absolute_downloads.extend(absolute_segments)
 
     return {
         **stream,
         "init_bytes": init_bytes,
         "init_segment_url": init_segment_url,
         "segment_urls": segment_urls,
-        "absolute_urls": urls,
+        "absolute_segments": absolute_segments,
+        "absolute_urls": [segment["url"] for segment in absolute_downloads],
+        "absolute_downloads": absolute_downloads,
         "absolute_base_url": base_url,
     }
 
@@ -976,7 +1036,7 @@ def _download_stream_fragments(stream: dict[str, Any], target_dir: Path, segment
     output_path = target_dir.with_suffix(".mp4")
     part_path = output_path.with_suffix(".mp4.part")
     headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://player.vimeo.com/"}
-    segment_paths = _download_stream_segments_parallel(stream["absolute_urls"], target_dir, headers, segment_workers)
+    segment_paths = _download_stream_segments_parallel(stream["absolute_downloads"], target_dir, headers, segment_workers)
 
     with part_path.open("wb") as out:
         if stream.get("init_bytes"):
@@ -990,19 +1050,19 @@ def _download_stream_fragments(stream: dict[str, Any], target_dir: Path, segment
 
 
 def _download_stream_segments_parallel(
-    urls: list[str],
+    segments: list[dict[str, Any]],
     target_dir: Path,
     headers: dict[str, str],
     segment_workers: int,
 ) -> list[Path]:
-    if not urls:
+    if not segments:
         return []
     workers = max(1, segment_workers)
-    results: list[Path | None] = [None] * len(urls)
+    results: list[Path | None] = [None] * len(segments)
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {
-            executor.submit(_download_segment, index, url, target_dir, headers): index
-            for index, url in enumerate(urls)
+            executor.submit(_download_segment, index, segment, target_dir, headers): index
+            for index, segment in enumerate(segments)
         }
         for future in as_completed(futures):
             index, path = future.result()
@@ -1024,33 +1084,49 @@ def _decode_init_segment(init_segment: Any) -> bytes:
     return base64.b64decode(payload)
 
 
-def _download_segment(index: int, url: str, target_dir: Path, headers: dict[str, str]) -> tuple[int, Path]:
+def _download_segment(index: int, segment: dict[str, Any], target_dir: Path, headers: dict[str, str]) -> tuple[int, Path]:
+    url = segment["url"]
+    expected_size = segment.get("size")
     path = target_dir / f"{index:06d}.m4s"
-    if path.exists() and path.stat().st_size > 0:
+    if path.exists() and _segment_size_ok(path, expected_size):
         return index, path
-    _download_url(url, path, headers)
+    _download_url(url, path, headers, expected_size=expected_size)
     return index, path
 
 
-def _download_url(url: str, path: Path, headers: dict[str, str], retries: int = 3) -> None:
+def _download_url(url: str, path: Path, headers: dict[str, str], expected_size: int | None = None, retries: int = 3) -> None:
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
+        part_path = path.with_suffix(f"{path.suffix}.part.{os.getpid()}.{threading.get_ident()}.{attempt}")
         try:
             session = _get_session()
             response = session.get(url, headers=headers, timeout=DOWNLOAD_TIMEOUT_SEC, stream=True)
             response.raise_for_status()
-            part_path = path.with_suffix(path.suffix + ".part")
             with part_path.open("wb") as out:
                 for chunk in response.iter_content(chunk_size=1024 * 256):
                     if chunk:
                         out.write(chunk)
+            if not part_path.exists() or part_path.stat().st_size == 0:
+                raise RuntimeError(f"empty segment temp file: {part_path}")
+            if expected_size and part_path.stat().st_size < expected_size:
+                raise RuntimeError(
+                    f"short segment download: got {part_path.stat().st_size}, expected {expected_size}"
+                )
             part_path.replace(path)
             return
-        except (requests.RequestException, TimeoutError) as exc:
+        except (requests.RequestException, TimeoutError, RuntimeError, OSError) as exc:
             last_error = exc
+            if part_path.exists():
+                part_path.unlink()
             if attempt < retries:
                 time.sleep(1.5 * attempt)
     raise RuntimeError(f"segment download failed after {retries} retries: {url}: {last_error}")
+
+
+def _segment_size_ok(path: Path, expected_size: int | None) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    return not expected_size or path.stat().st_size >= expected_size
 
 
 def _get_session() -> requests.Session:
