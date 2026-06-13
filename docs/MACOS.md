@@ -45,5 +45,8 @@ Keep this browser open while downloading.
 python scripts/download_videoteca.py --doctor
 python scripts/download_videoteca.py --list-categories
 python scripts/download_videoteca.py --category lzheturizm --limit 2
-python scripts/download_videoteca.py --all --segment-workers 8
+python -u scripts/download_videoteca.py --all --video-workers 1 --segment-workers 8
+python -u scripts/download_videoteca.py --all --video-workers 2 --segment-workers 4
 ```
+
+`--video-workers` controls parallel videos. `--segment-workers` controls parallel DASH segments inside one video. If Vimeo timeout, SSL, or connection reset errors increase, reduce `--video-workers`.
