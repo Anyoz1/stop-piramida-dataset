@@ -52,6 +52,7 @@ REFRESH_CATEGORIES = [
 
 _PLAYWRIGHT = None
 _THREAD_LOCAL = threading.local()
+_STATUS_LOCK = threading.Lock()
 
 
 def connect_browser(cdp_url: str = DEFAULT_CDP_URL) -> Browser:
@@ -67,6 +68,19 @@ def connect_browser(cdp_url: str = DEFAULT_CDP_URL) -> Browser:
             "Chromium CDP is not available.\n"
             f"{browser_start_help()}\n"
             f"Then rerun this script. CDP URL: {cdp_url}"
+        ) from exc
+
+
+def connect_browser_for_thread(cdp_url: str = DEFAULT_CDP_URL) -> tuple[Any, Browser]:
+    playwright = sync_playwright().start()
+    try:
+        return playwright, playwright.chromium.connect_over_cdp(cdp_url)
+    except PlaywrightError as exc:
+        playwright.stop()
+        raise RuntimeError(
+            "Chromium CDP is not available for a video worker.\n"
+            f"{browser_start_help()}\n"
+            f"CDP URL: {cdp_url}"
         ) from exc
 
 
@@ -130,8 +144,8 @@ def extract_videos(page: Page, category: str) -> list[dict[str, str]]:
     return deduped
 
 
-def get_playlist(page: Page, video: dict[str, str], timeout_ms: int = PLAYLIST_TIMEOUT_MS) -> tuple[dict[str, Any], str]:
-    playlist_responses: list[tuple[str, dict[str, Any]]] = []
+def get_playlist(page: Page, video: dict[str, str], timeout_ms: int = PLAYLIST_TIMEOUT_MS, worker_id: int = 1) -> tuple[dict[str, Any], str]:
+    playlist_responses: list[tuple[dict[str, Any], str]] = []
     page_url = video["page_url"]
     logged_playlists: set[str] = set()
 
@@ -141,21 +155,34 @@ def get_playlist(page: Page, video: dict[str, str], timeout_ms: int = PLAYLIST_T
             return
         if url not in logged_playlists:
             logged_playlists.add(url)
-            print(f"FOUND PLAYLIST: {url}")
+            print(f"[W{worker_id}] FOUND PLAYLIST: {url}")
         try:
-            playlist_responses.append((url, response.json()))
+            playlist = response.json()
+            if isinstance(playlist, dict):
+                playlist_responses.append((playlist, url))
         except Exception:
             pass
 
     page.on("response", on_response)
     try:
         with page.expect_response(lambda r: "playlist.json" in r.url, timeout=timeout_ms) as response_info:
-            print("PLAYLIST WAITING")
-            print(f"OPEN PAGE: {page_url}")
+            print(f"[W{worker_id}] PLAYLIST WAITING")
+            print(f"[W{worker_id}] OPEN PAGE: {page_url}")
             page.goto(page_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-            _start_vimeo_playback(page, video)
+            _start_vimeo_playback(page, video, worker_id=worker_id)
         response = response_info.value
-        return response.json(), response.url
+        try:
+            playlist = response.json()
+        except Exception:
+            playlist = None
+        if isinstance(playlist, dict):
+            return playlist, response.url
+        deadline = time.time() + timeout_ms / 1000
+        while time.time() < deadline:
+            if playlist_responses:
+                return playlist_responses[-1]
+            page.wait_for_timeout(500)
+        raise RuntimeError(f"Vimeo playlist response was not a JSON object for {page_url}")
     except PlaywrightTimeoutError as exc:
         deadline = time.time() + timeout_ms / 1000
         while time.time() < deadline:
@@ -168,7 +195,7 @@ def get_playlist(page: Page, video: dict[str, str], timeout_ms: int = PLAYLIST_T
 
 
 def select_best_stream(playlist: dict[str, Any], playlist_url: str = "") -> dict[str, Any]:
-    streams = playlist.get("video") or []
+    streams = _coerce_stream_list(playlist.get("video"))
     if not streams:
         streams = _extract_streams_recursively(playlist)
     if not streams:
@@ -255,6 +282,10 @@ def save_metadata(video: dict[str, Any], playlist_info: dict[str, Any], output_p
 
 def main() -> None:
     args = _parse_args()
+    if args.video_workers < 1:
+        raise SystemExit("--video-workers must be >= 1")
+    if args.segment_workers < 1:
+        raise SystemExit("--segment-workers must be >= 1")
     metadata_path = Path(args.metadata)
     output_dir = Path(args.output_dir)
     status_path = metadata_path.parent / "download_status.jsonl"
@@ -330,51 +361,130 @@ def download_videos(
     raw_dir: Path,
     status_path: Path,
 ) -> None:
-    browser = connect_browser(args.cdp_url)
-    try:
-        context = browser.contexts[0] if browser.contexts else browser.new_context()
-        page = context.new_page()
-        total = len(videos)
-        if total == 0:
-            print("Nothing to download.")
-            return
+    total = len(videos)
+    if total == 0:
+        print("Nothing to download.")
+        return
 
-        for index, video in enumerate(videos, start=1):
-            category = video["category"]
-            vimeo_id = video["vimeo_id"]
-            output_path = output_dir / category / f"{vimeo_id}.mp4"
-            if args.skip_existing and output_path.exists() and output_path.stat().st_size > 0:
-                print(f"[{index}/{total}] Skipping existing {output_path}")
-                _write_status(status_path, video, "ok", output_path, "skipped existing")
-                continue
-
-            print(f"[{index}/{total}] Downloading {category}/{vimeo_id} ...")
+    if args.video_workers <= 1:
+        browser = connect_browser(args.cdp_url)
+        try:
+            context = browser.new_context()
+            page = context.new_page()
             try:
-                total_start = time.perf_counter()
-                playlist_start = time.perf_counter()
-                playlist, playlist_url = get_playlist(page, video)
-                playlist_seconds = time.perf_counter() - playlist_start
-                print(f"playlist: {playlist_seconds:.1f}s")
-                playlist_info = select_best_stream(playlist, playlist_url)
-                _save_raw_playlist(raw_dir, category, vimeo_id, playlist)
-                work_dir = raw_dir / "segments" / category / vimeo_id
-                downloaded = download_segments(playlist_info, work_dir, args.segment_workers)
-                segment_mb = downloaded["bytes"] / 1024 / 1024
-                segment_speed = segment_mb / downloaded["seconds"] if downloaded["seconds"] else 0
-                print(f"segments: {downloaded['seconds']:.1f}s, {segment_mb:.1f} MB, {segment_speed:.2f} MB/s")
-                ffmpeg_seconds = merge_segments(downloaded, output_path)
-                print(f"ffmpeg: {ffmpeg_seconds:.1f}s")
-                save_metadata(video, playlist_info, output_path)
-                output_mb = output_path.stat().st_size / 1024 / 1024
-                total_seconds = time.perf_counter() - total_start
-                total_speed = output_mb / total_seconds if total_seconds else 0
-                _write_status(status_path, video, "ok", output_path, "")
-                print(f"[✓] Saved {output_path} ({output_mb:.1f} MB, avg {total_speed:.2f} MB/s)")
-            except Exception as exc:
-                _write_status(status_path, video, "failed", output_path, str(exc))
-                print(f"[!] Failed {category}/{vimeo_id}: {exc}")
+                for index, video in enumerate(videos, start=1):
+                    process_one_video(
+                        worker_id=1,
+                        index=index,
+                        total=total,
+                        page=page,
+                        video=video,
+                        args=args,
+                        output_dir=output_dir,
+                        raw_dir=raw_dir,
+                        status_path=status_path,
+                    )
+            finally:
+                context.close()
+            return
+        finally:
+            close_browser(browser)
+
+    print(f"[INFO] video-workers={args.video_workers}, segment-workers={args.segment_workers}")
+    print("[INFO] If Vimeo, SSL, or timeout errors increase, reduce --video-workers.")
+    with ThreadPoolExecutor(max_workers=args.video_workers) as executor:
+        futures = []
+        for index, video in enumerate(videos, start=1):
+            worker_id = ((index - 1) % args.video_workers) + 1
+            futures.append(
+                executor.submit(
+                    process_one_video_in_worker,
+                    args.cdp_url,
+                    worker_id,
+                    index,
+                    total,
+                    video,
+                    args,
+                    output_dir,
+                    raw_dir,
+                    status_path,
+                )
+            )
+        for future in as_completed(futures):
+            future.result()
+
+
+def process_one_video_in_worker(
+    cdp_url: str,
+    worker_id: int,
+    index: int,
+    total: int,
+    video: dict[str, str],
+    args: argparse.Namespace,
+    output_dir: Path,
+    raw_dir: Path,
+    status_path: Path,
+) -> None:
+    playwright, browser = connect_browser_for_thread(cdp_url)
+    context = None
+    try:
+        context = browser.new_context()
+        page = context.new_page()
+        process_one_video(worker_id, index, total, page, video, args, output_dir, raw_dir, status_path)
     finally:
-        close_browser(browser)
+        try:
+            if context is not None:
+                context.close()
+            browser.close()
+        finally:
+            playwright.stop()
+
+
+def process_one_video(
+    worker_id: int,
+    index: int,
+    total: int,
+    page: Page,
+    video: dict[str, str],
+    args: argparse.Namespace,
+    output_dir: Path,
+    raw_dir: Path,
+    status_path: Path,
+) -> None:
+    category = video["category"]
+    vimeo_id = video["vimeo_id"]
+    output_path = output_dir / category / f"{vimeo_id}.mp4"
+    prefix = f"[W{worker_id} {index}/{total}]"
+    if args.skip_existing and output_path.exists() and output_path.stat().st_size > 0:
+        print(f"{prefix} Skipping existing {output_path}")
+        _write_status(status_path, video, "ok", output_path, "skipped existing")
+        return
+
+    print(f"{prefix} Downloading {category}/{vimeo_id} ...")
+    try:
+        total_start = time.perf_counter()
+        playlist_start = time.perf_counter()
+        playlist, playlist_url = get_playlist(page, video, worker_id=worker_id)
+        playlist_seconds = time.perf_counter() - playlist_start
+        print(f"{prefix} playlist: {playlist_seconds:.1f}s")
+        playlist_info = select_best_stream(playlist, playlist_url)
+        _save_raw_playlist(raw_dir, category, vimeo_id, playlist)
+        work_dir = raw_dir / "segments" / category / vimeo_id
+        downloaded = download_segments(playlist_info, work_dir, args.segment_workers)
+        segment_mb = downloaded["bytes"] / 1024 / 1024
+        segment_speed = segment_mb / downloaded["seconds"] if downloaded["seconds"] else 0
+        print(f"{prefix} segments: {downloaded['seconds']:.1f}s, {segment_mb:.1f} MB, {segment_speed:.2f} MB/s")
+        ffmpeg_seconds = merge_segments(downloaded, output_path)
+        print(f"{prefix} ffmpeg: {ffmpeg_seconds:.1f}s")
+        save_metadata(video, playlist_info, output_path)
+        output_mb = output_path.stat().st_size / 1024 / 1024
+        total_seconds = time.perf_counter() - total_start
+        total_speed = output_mb / total_seconds if total_seconds else 0
+        _write_status(status_path, video, "ok", output_path, "")
+        print(f"[W{worker_id} ✓] Saved {output_path} ({output_mb:.1f} MB, avg {total_speed:.2f} MB/s)")
+    except Exception as exc:
+        _write_status(status_path, video, "failed", output_path, str(exc))
+        print(f"[W{worker_id} !] Failed {category}/{vimeo_id}: {exc}")
 
 
 def read_metadata(path: Path) -> list[dict[str, str]]:
@@ -636,6 +746,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--refresh", action="store_true", help="re-parse stop-piramida.kz and update metadata")
     parser.add_argument("--limit", type=int, help="download or show only N videos")
     parser.add_argument("--start-after", help="start after this Vimeo id")
+    parser.add_argument("--video-workers", type=int, default=1, help="parallel video workers, each with its own Playwright context/page")
     parser.add_argument("--segment-workers", type=int, default=8, help="parallel segment workers per audio/video track")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="directory for downloaded mp4 files")
     parser.add_argument("--metadata", default=str(DEFAULT_METADATA), help="metadata JSONL path")
@@ -669,34 +780,34 @@ def _find_show_more_button(page: Page) -> Any | None:
     return None
 
 
-def _start_vimeo_playback(page: Page, video: dict[str, str]) -> None:
+def _start_vimeo_playback(page: Page, video: dict[str, str], worker_id: int = 1) -> None:
     vimeo_id = video.get("vimeo_id") or _extract_vimeo_id(video.get("vimeo_url", ""))
-    if _log_vimeo_iframe(page, timeout_ms=1_000, vimeo_id=vimeo_id):
+    if _log_vimeo_iframe(page, timeout_ms=1_000, vimeo_id=vimeo_id, worker_id=worker_id):
         return
 
     block = _find_video_block(page, vimeo_id)
     if block is not None:
-        print("VIDEO BLOCK FOUND")
+        print(f"[W{worker_id}] VIDEO BLOCK FOUND")
         try:
             block.scroll_into_view_if_needed(timeout=5_000)
         except Exception:
             pass
 
         try:
-            print("CLICK FORCE")
+            print(f"[W{worker_id}] CLICK FORCE")
             block.click(timeout=7_000, force=True)
         except Exception:
             try:
-                print("CLICK JS")
+                print(f"[W{worker_id}] CLICK JS")
                 page.evaluate("(el) => el.click()", block)
             except Exception:
                 pass
 
-        if _wait_for_vimeo_iframe(page, vimeo_id, timeout_ms=7_000):
+        if _wait_for_vimeo_iframe(page, vimeo_id, timeout_ms=7_000, worker_id=worker_id):
             return
 
-    _inject_vimeo_iframe(page, vimeo_id)
-    _wait_for_vimeo_iframe(page, vimeo_id, timeout_ms=7_000)
+    _inject_vimeo_iframe(page, vimeo_id, worker_id=worker_id)
+    _wait_for_vimeo_iframe(page, vimeo_id, timeout_ms=7_000, worker_id=worker_id)
 
 
 def _find_video_block(page: Page, vimeo_id: str) -> Any | None:
@@ -727,7 +838,7 @@ def _find_video_block(page: Page, vimeo_id: str) -> Any | None:
     return None
 
 
-def _wait_for_vimeo_iframe(page: Page, vimeo_id: str, timeout_ms: int) -> bool:
+def _wait_for_vimeo_iframe(page: Page, vimeo_id: str, timeout_ms: int, worker_id: int = 1) -> bool:
     if vimeo_id:
         selector = f"iframe[src*='player.vimeo.com/video/{vimeo_id}']"
     else:
@@ -736,13 +847,13 @@ def _wait_for_vimeo_iframe(page: Page, vimeo_id: str, timeout_ms: int) -> bool:
     try:
         iframe = page.wait_for_selector(selector, timeout=timeout_ms)
         src = iframe.get_attribute("src") or ""
-        print(f"FOUND IFRAME: {src}")
+        print(f"[W{worker_id}] FOUND IFRAME: {src}")
         return True
     except PlaywrightTimeoutError:
-        return _log_vimeo_iframe(page, timeout_ms=500, vimeo_id=vimeo_id)
+        return _log_vimeo_iframe(page, timeout_ms=500, vimeo_id=vimeo_id, worker_id=worker_id)
 
 
-def _inject_vimeo_iframe(page: Page, vimeo_id: str) -> None:
+def _inject_vimeo_iframe(page: Page, vimeo_id: str, worker_id: int = 1) -> None:
     if not vimeo_id:
         return
     iframe_url = f"https://player.vimeo.com/video/{vimeo_id}?color=fdbb03&autoplay=1&app_id=122963"
@@ -768,25 +879,25 @@ def _inject_vimeo_iframe(page: Page, vimeo_id: str) -> None:
         """,
         iframe_url,
     )
-    print("IFRAME INJECTED")
+    print(f"[W{worker_id}] IFRAME INJECTED")
 
 
-def _log_vimeo_iframe(page: Page, timeout_ms: int, vimeo_id: str = "") -> bool:
+def _log_vimeo_iframe(page: Page, timeout_ms: int, vimeo_id: str = "", worker_id: int = 1) -> bool:
     selector = f"iframe[src*='player.vimeo.com/video/{vimeo_id}']" if vimeo_id else "iframe[src*='vimeo.com']"
     try:
         iframe = page.wait_for_selector(selector, timeout=timeout_ms)
         src = iframe.get_attribute("src") or ""
-        print(f"FOUND IFRAME: {src}")
+        print(f"[W{worker_id}] FOUND IFRAME: {src}")
         return True
     except PlaywrightTimeoutError:
         pass
 
     for frame in page.frames:
         if "vimeo.com" in frame.url and (not vimeo_id or vimeo_id in frame.url):
-            print(f"FOUND IFRAME: {frame.url}")
+            print(f"[W{worker_id}] FOUND IFRAME: {frame.url}")
             return True
 
-    print("FOUND IFRAME: <none>")
+    print(f"[W{worker_id}] FOUND IFRAME: <none>")
     return False
 
 
@@ -803,8 +914,21 @@ def _extract_streams_recursively(value: Any) -> list[dict[str, Any]]:
     return found
 
 
+def _coerce_stream_list(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, dict):
+        if value.get("segments") and (value.get("init_segment") or value.get("init_segment_url")):
+            return [value]
+        streams: list[dict[str, Any]] = []
+        for child in value.values():
+            streams.extend(_coerce_stream_list(child))
+        return streams
+    return []
+
+
 def _select_best_audio_stream(playlist: dict[str, Any]) -> dict[str, Any] | None:
-    streams = playlist.get("audio") or []
+    streams = _coerce_stream_list(playlist.get("audio"))
     streams = [item for item in streams if item.get("segments") and (item.get("init_segment") or item.get("init_segment_url"))]
     if not streams:
         return None
@@ -956,8 +1080,9 @@ def _write_status(status_path: Path, video: dict[str, Any], status: str, file_pa
         "error": error,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    with status_path.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    with _STATUS_LOCK:
+        with status_path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def _save_category_index(metadata_dir: Path, category: str, videos: list[dict[str, str]]) -> None:
