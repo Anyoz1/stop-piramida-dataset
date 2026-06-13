@@ -1,8 +1,8 @@
-# Stop-Piramida Video Dataset Downloader
+# Stop-Piramida Video Dataset Package
 
-Metadata and a cross-platform downloader for 593 public videos from Stop-Piramida.kz.
+Reproducible video dataset package for anti-fraud, media monitoring, and evidence-oriented analysis tasks based on 593 public videos from Stop-Piramida.kz.
 
-The videos are not stored in this GitHub repository. Users download the videos locally with the included Playwright-based downloader.
+The videos are not stored in this GitHub repository. GitHub stores the dataset index, schema, release descriptors, documentation, and recovery scripts. Users can reconstruct the local media layer from metadata with the included downloader.
 
 ## Dataset Stats
 
@@ -10,6 +10,141 @@ The videos are not stored in this GitHub repository. Users download the videos l
 - Downloaded locally by maintainer: 590
 - Missing known: 3
 - Source: https://stop-piramida.kz/videos
+
+## Dataset Architecture
+
+The dataset is organized as a reproducible package with separate layers.
+
+### Dataset Layers
+
+Metadata layer:
+
+```text
+data/metadata/
+```
+
+This is the primary dataset index and is stored in GitHub. The canonical file is:
+
+```text
+data/metadata/all_videos.jsonl
+```
+
+Additional metadata files include:
+
+```text
+data/metadata/all_videos.json
+data/metadata/download_status.jsonl
+data/metadata/<category>.jsonl
+```
+
+Media layer:
+
+```text
+outputs/videos/<category>/<vimeo_id>.mp4
+```
+
+These are the final downloaded videos. They are not stored in GitHub because of size. Any user can reconstruct this layer locally from the metadata layer.
+
+Sidecar metadata layer:
+
+```text
+outputs/videos/<category>/<vimeo_id>.json
+```
+
+These local JSON files describe a specific downloaded video, including its source page, Vimeo ID, category, output path, status, and available technical checks such as size or validation information.
+
+Raw / temporary layer:
+
+```text
+data/raw/segments/
+data/raw/failed_segments/
+```
+
+This layer contains intermediate DASH segments, cache files, and failed debug artifacts. It is not part of the final dataset and is not pushed to GitHub.
+
+Release layer:
+
+```text
+release/
+```
+
+This layer is used for publishing or transferring the dataset package. It contains:
+
+```text
+release/videos.csv
+release/missing_videos.txt
+release/videos.sha256
+release/metadata/
+release/scripts/
+release/drive_link.txt
+```
+
+### Canonical Dataset Index
+
+The canonical source of truth is:
+
+```text
+data/metadata/all_videos.jsonl
+```
+
+One line equals one video. Each record describes the category, Vimeo ID, title, source page URL, and Vimeo URL. The source is Stop-Piramida.kz, and the expected local video path is derived from `category` and `vimeo_id`. Programmatic analysis should start from this JSONL file.
+
+### Category Structure
+
+Categories correspond to Stop-Piramida videotheque sections. Metadata and local videos use the same category-based structure:
+
+```text
+data/metadata/fishing.jsonl
+outputs/videos/fishing/<vimeo_id>.mp4
+
+data/metadata/dropperstvo.jsonl
+outputs/videos/dropperstvo/<vimeo_id>.mp4
+```
+
+### Dataset Reproducibility
+
+GitHub stores metadata, schema, scripts, documentation, and release descriptors. GitHub does not store MP4 files. This keeps the repository small while allowing any user to clone it and restore the media layer locally.
+
+### Expected Local Structure
+
+```text
+stop-piramida-dataset/
+├── data/
+│   ├── metadata/
+│   │   ├── all_videos.jsonl
+│   │   ├── all_videos.json
+│   │   ├── download_status.jsonl
+│   │   └── <category>.jsonl
+│   └── raw/
+│       ├── segments/
+│       └── failed_segments/
+├── outputs/
+│   └── videos/
+│       └── <category>/
+│           ├── <vimeo_id>.mp4
+│           └── <vimeo_id>.json
+├── docs/
+│   └── DATASET_SCHEMA.md
+├── release/
+│   ├── videos.csv
+│   ├── missing_videos.txt
+│   ├── videos.sha256
+│   ├── drive_link.txt
+│   ├── metadata/
+│   └── scripts/
+└── scripts/
+```
+
+### Intended Downstream Use
+
+This dataset is intended for:
+
+- Whisper ASR / speech-to-text
+- OCR on video frames
+- Entity extraction: phones, URLs, Telegram usernames, domains, promo codes, amounts, crypto wallets
+- Fraud scenario detection
+- Media monitoring
+- Anti-fraud evidence reports
 
 ## Requirements
 
@@ -110,17 +245,7 @@ Existing MP4 files are skipped by default, so rerunning the command resumes the 
 - `--segment-workers` controls how many DASH segments are downloaded in parallel inside one video.
 - Reliability is more important than peak speed. If Vimeo playlist timeouts, SSL errors, connection resets, or failed segments increase, reduce `--video-workers` first.
 
-Each video uses a unique temp directory:
-
-```text
-data/raw/segments/<category>/<vimeo_id>.<pid>.<worker_id>.<timestamp>/
-```
-
-Segments are downloaded into `.part` files, checked, and atomically renamed. If a segment fails, `ffmpeg` is not started for that video. After `ffmpeg`, the final MP4 is checked with `ffprobe -v error`. Failed temp directories are preserved under:
-
-```text
-data/raw/failed_segments/<category>/<vimeo_id>...
-```
+Temporary and failed download artifacts are kept under `data/raw/`, which is excluded from GitHub and is not part of the final dataset package.
 
 ## Useful Commands
 
@@ -222,9 +347,9 @@ Refresh one category:
 python scripts/download_videoteca.py --refresh --category fishing
 ```
 
-## How It Works
+## Media Layer Recovery
 
-The downloader does not use `yt-dlp`. It opens each Stop-Piramida `page_url`, starts the embedded Vimeo player, captures Vimeo `playlist.json`, downloads DASH video/audio segments, handles base64 `init_segment`, and merges tracks with `ffmpeg`.
+The downloader is included only as a recovery mechanism for the media layer. It reads the canonical metadata index and writes local MP4 files under `outputs/videos/<category>/`.
 
 ## Troubleshooting
 
